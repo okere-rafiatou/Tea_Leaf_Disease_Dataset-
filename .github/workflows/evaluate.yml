@@ -1,0 +1,105 @@
+name: Evaluate Tea Leaf Submission
+
+on:
+  pull_request:
+    paths:
+      - 'submission/**'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install numpy scikit-learn
+
+      - name: Decode test labels
+        env:
+          TEST_LABELS_B64: ${{ secrets.TEST_LABELS_BASE64 }}
+        run: |
+          echo "$TEST_LABELS_B64" | base64 --decode > evaluation/test_labels.csv
+
+      - name: Detect submitted file
+        id: submission
+        run: |
+          FILE=$(git diff --name-only --diff-filter=A origin/${{ github.base_ref }}...HEAD | grep '^submission/' | head -n1)
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+          echo "Detected: $FILE"
+
+      - name: Fail if no submission found
+        if: steps.submission.outputs.file == ''
+        run: |
+          echo "No submission file found in submission/"
+          exit 1
+
+      - name: Run evaluation
+        if: steps.submission.outputs.file != ''
+        run: python evaluation/score.py "${{ steps.submission.outputs.file }}"
+
+      - name: Update leaderboard
+        if: steps.submission.outputs.file != ''
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: python leaderboard/update.py score.json
+
+      - name: Commit leaderboard to main
+        if: steps.submission.outputs.file != ''
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git stash
+          git checkout main
+          git stash pop
+          git add leaderboard/README.md scores.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Leaderboard update: ${{ github.actor }}"
+          git push origin main
+
+      - name: Post score as PR comment
+        if: steps.submission.outputs.file != ''
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const score = JSON.parse(fs.readFileSync('score.json', 'utf8'));
+            const accuracy  = (score.accuracy * 100).toFixed(2);
+            const f1        = (score.f1_macro * 100).toFixed(2);
+            const precision = (score.precision * 100).toFixed(2);
+            const recall    = (score.recall * 100).toFixed(2);
+
+            let grade = '';
+            if (score.accuracy >= 0.90) grade = 'Excellent 🌟';
+            else if (score.accuracy >= 0.80) grade = 'Good 👍';
+            else if (score.accuracy >= 0.70) grade = 'Fair ✅';
+            else if (score.accuracy >= 0.50) grade = 'Needs improvement 📈';
+            else grade = 'Keep trying 💪';
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🍃 Tea Leaf Submission Evaluated\n\n` +
+                    `**Participant:** @${{ github.actor }}\n\n` +
+                    `| Metric | Score | Grade |\n` +
+                    `|--------|-------|-------|\n` +
+                    `| 🎯 Accuracy | **${accuracy}%** | ${grade} |\n` +
+                    `| 📐 F1 Score (macro) | **${f1}%** | - |\n` +
+                    `| 🔍 Precision | **${precision}%** | - |\n` +
+                    `| 📡 Recall | **${recall}%** | - |\n\n` +
+                    `> See full rankings → [Leaderboard](https://github.com/${{ github.repository }}/blob/main/leaderboard/README.md)`
+            });
